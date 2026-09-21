@@ -42,6 +42,9 @@ distance = (proposed - current) mod 2^32
 
 ## API
 
+服务地址：<http://localhost:8000>（Swagger 文档：<http://localhost:8000/docs>）。
+以下示例均可在 `docker compose up --build -d` 一键启动后直接运行。
+
 ### `POST /audit` — 审计拟发布值
 
 请求：
@@ -133,13 +136,134 @@ curl -s http://localhost:8000/propose -H 'Content-Type: application/json' -d '{
 }
 ```
 
+### `POST /transfer-plan` — 规划 IXFR/AXFR 传输计划
+
+接收**目标 SOA 序列号**、各副本当前值与一组**无序 IXFR 增量**
+（`from_serial`、`to_serial`）。先做增量集合校验，再为每个副本沿增量链追到目标。
+
+**增量集合校验（422，任一非法即整体拒绝）：**
+
+- 非严格更新的增量：`to_serial` 相对 `from_serial` 不是 RFC 1982 意义上的
+  `newer`（即 `equal` / `older` / `ambiguous`，包含前向距离恰好 2³¹ 的正对点）；
+- 分叉：同一 `from_serial` 指向不同 `to_serial`；
+- 完全相同的重复增量自动去重，不报错。
+
+**链路规划（逐副本，`results` 保持副本输入顺序）：**
+
+| `mode` | 条件 | `ordered_deltas` | `reason` |
+|---|---|---|---|
+| `up_to_date` | 当前值已等于目标 | `[]` | `null` |
+| `ixfr` | 存在唯一完整链（分叉已拒绝，故链唯一） | 按应用顺序排列的增量链 | `null` |
+| `axfr` | 遇到缺口 / 环路 / 与目标不可比较，回退全量传输 | `[]` | 见下 |
+
+`reason` 取值：
+
+- `chain_gap`：缺口——链头找不到以它为 `from_serial` 的增量，无法到达目标；
+- `cycle_detected`：环路——链重复经过某个序列号（每跳都严格更新也可能绕环一周成环）；
+- `target_not_comparable`：目标相对当前值为回退（`older`）或正对点（`ambiguous`），
+  沿严格更新的增量链不可能追到目标。
+
+链路匹配只按 `from_serial` 精确衔接下一跳，**遵循 RFC 1982 环形顺序，不按整数大小排序**
+（例如 `4294967295 -> 0` 是合法增量，而 `0 -> 4294967295` 是回退，必须拒绝）。
+
+请求（注意增量是乱序给的，还故意混入重复项）：
+
+```bash
+curl -s http://localhost:8000/transfer-plan -H 'Content-Type: application/json' -d '{
+  "target": 105,
+  "replicas": [
+    {"name": "ns-a", "current": 100},
+    {"name": "ns-b", "current": 105},
+    {"name": "ns-c", "current": 50},
+    {"name": "ns-d", "current": 200}
+  ],
+  "deltas": [
+    {"from_serial": 103, "to_serial": 105},
+    {"from_serial": 100, "to_serial": 101},
+    {"from_serial": 101, "to_serial": 103},
+    {"from_serial": 100, "to_serial": 101}
+  ]
+}'
+```
+
+```json
+{
+  "target": 105,
+  "results": [
+    {
+      "name": "ns-a",
+      "current": 100,
+      "mode": "ixfr",
+      "ordered_deltas": [
+        {"from_serial": 100, "to_serial": 101},
+        {"from_serial": 101, "to_serial": 103},
+        {"from_serial": 103, "to_serial": 105}
+      ],
+      "reason": null
+    },
+    {
+      "name": "ns-b",
+      "current": 105,
+      "mode": "up_to_date",
+      "ordered_deltas": [],
+      "reason": null
+    },
+    {
+      "name": "ns-c",
+      "current": 50,
+      "mode": "axfr",
+      "ordered_deltas": [],
+      "reason": "chain_gap"
+    },
+    {
+      "name": "ns-d",
+      "current": 200,
+      "mode": "axfr",
+      "ordered_deltas": [],
+      "reason": "target_not_comparable"
+    }
+  ]
+}
+```
+
+序列号回绕的增量链同样支持（`4294967295 -> 0` 是严格推进）：
+
+```bash
+curl -s http://localhost:8000/transfer-plan -H 'Content-Type: application/json' -d '{
+  "target": 1,
+  "replicas": [{"name": "ns-a", "current": 4294967294}],
+  "deltas": [
+    {"from_serial": 4294967295, "to_serial": 0},
+    {"from_serial": 4294967294, "to_serial": 4294967295},
+    {"from_serial": 0, "to_serial": 1}
+  ]
+}'
+# mode: "ixfr"
+# ordered_deltas: [4294967294->4294967295, 4294967295->0, 0->1]
+```
+
+非法增量集合返回 **422 Unprocessable Entity**：
+
+```json
+{"detail": {"error": "delta_not_strictly_newer",
+            "from_serial": 0, "to_serial": 4294967295,
+            "relation": "older", "forward_distance": 4294967295}}
+```
+
+```json
+{"detail": {"error": "conflicting_deltas",
+            "from_serial": 1, "to_serials": [2, 3]}}
+```
+
 ### 输入校验（422）
 
 以下情况返回 **422 Unprocessable Entity**：
 
 - 序列号越界：必须为整数且在 `[0, 4294967295]`（即 `[0, 2^32-1]`）；
-- 副本名重复（`/audit`、`/propose` 均检查）；
-- 副本名为空 / `replicas` 为空数组。
+- 副本名重复（`/audit`、`/propose`、`/transfer-plan` 均检查）；
+- 副本名为空 / `replicas` 为空数组；
+- `/transfer-plan` 专属：增量非严格更新（`delta_not_strictly_newer`）、
+  同一 `from_serial` 分叉（`conflicting_deltas`）。
 
 ## 算法说明
 
@@ -149,6 +273,12 @@ curl -s http://localhost:8000/propose -H 'Content-Type: application/json' -d '{
 因此只需枚举各副本当前值的“紧邻后继”，检查其对所有副本的前向距离均在 `[1, 2³¹−1]`，
 再按 `(最大前向距离, 候选数值)` 取最小即可。
 
+`/transfer-plan` 的算法：增量先按 `from_serial` 建索引（重复去重、分叉拒绝，
+并按 RFC 1982 前向距离校验每跳严格更新）；随后从副本当前值出发，以
+`from_serial` 精确匹配逐跳推进，并记录已访问序列号——等于目标即 `ixfr`，
+无下一跳即 `chain_gap`，重复访问即 `cycle_detected`；起步时目标若不在当前值
+前半环内（回退或正对点）则直接判 `target_not_comparable`。整段过程不做整数排序。
+
 ## 测试
 
 核心环形算术不依赖 FastAPI，可直接用标准库运行（另含小位宽空间对暴力穷举的对照测试）：
@@ -156,6 +286,10 @@ curl -s http://localhost:8000/propose -H 'Content-Type: application/json' -d '{
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+`tests/test_serial.py` 覆盖 RFC 1982 环形算术与 `/propose` 推导；
+`tests/test_transfer.py` 覆盖增量去重/校验、分叉拒绝与逐副本链路规划，
+并在 3/4/6 位小空间上与独立参考实现随机 + 穷举对照。
 
 ## 项目结构
 
@@ -165,8 +299,10 @@ python3 -m unittest discover -s tests -v
 │   ├── __init__.py
 │   ├── main.py        # FastAPI 路由与异常
 │   ├── schemas.py     # 请求/响应模型与 422 校验
-│   └── serial.py      # RFC 1982 环形算术（纯函数，零第三方依赖）
+│   ├── serial.py      # RFC 1982 环形算术（纯函数，零第三方依赖）
+│   └── transfer.py    # IXFR 增量链规划（纯函数，零第三方依赖）
 ├── tests/test_serial.py
+├── tests/test_transfer.py
 ├── requirements.txt
 ├── Dockerfile
 ├── compose.yaml

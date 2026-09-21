@@ -9,14 +9,24 @@ from .schemas import (
     AuditItem,
     AuditRequest,
     AuditResponse,
+    DeltaPair,
     ProposeItem,
     ProposeRequest,
     ProposeResponse,
+    TransferPlanItem,
+    TransferPlanRequest,
+    TransferPlanResponse,
 )
 from .serial import (
     compare_serial,
     forward_distance,
     propose_serial,
+)
+from .transfer import (
+    Delta,
+    DeltaSetError,
+    follow_delta_chain,
+    normalize_deltas,
 )
 
 app = FastAPI(
@@ -129,3 +139,60 @@ def propose(request: ProposeRequest) -> ProposeResponse:
         max_forward_distance=max_distance,
         results=results,
     )
+
+
+@app.post("/transfer-plan", response_model=TransferPlanResponse)
+def transfer_plan(request: TransferPlanRequest) -> TransferPlanResponse:
+    """为每个副本规划追到目标序列号的传输方式（IXFR / AXFR）。
+
+    先校验增量集合（422）：
+
+    * 非严格更新的增量（to_serial 相对 from_serial 为 equal / older /
+      ambiguous，按 RFC 1982 环形顺序判定）拒绝；
+    * 同一 from_serial 指向不同 to_serial 的分叉拒绝；
+    * 完全重复的增量去重。
+
+    再为每个副本沿增量链追到目标：
+
+    * ``up_to_date``：当前值已等于目标；
+    * ``ixfr``：存在唯一完整链，``ordered_deltas`` 按应用顺序返回；
+    * ``axfr``：遇到缺口（``chain_gap``）、环路（``cycle_detected``）
+      或与目标不可比较（``target_not_comparable``：目标相对当前值为回退
+      或正对点），回退全量传输并给出 ``reason``。
+
+    链路匹配只按 from_serial 精确衔接，不按整数大小排序；
+    ``results`` 保持副本输入顺序。
+    """
+    _check_duplicate_names([r.name for r in request.replicas])
+
+    try:
+        index = normalize_deltas(
+            [Delta(d.from_serial, d.to_serial) for d in request.deltas]
+        )
+    except DeltaSetError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": exc.error, **exc.detail},
+        )
+
+    results = []
+    for replica in request.replicas:
+        mode, chain, reason = follow_delta_chain(
+            replica.current, request.target, index
+        )
+        results.append(
+            TransferPlanItem(
+                name=replica.name,
+                current=replica.current,
+                mode=mode,
+                ordered_deltas=[
+                    DeltaPair(
+                        from_serial=delta.from_serial, to_serial=delta.to_serial
+                    )
+                    for delta in chain
+                ],
+                reason=reason,
+            )
+        )
+
+    return TransferPlanResponse(target=request.target, results=results)
