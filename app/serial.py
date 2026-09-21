@@ -81,3 +81,121 @@ def propose_serial(currents: List[int]) -> Optional[Tuple[int, int]]:
     # 先按最大前向距离排序，同分再按候选数值排序
     max_distance, proposed = min(feasible, key=lambda item: (item[0], item[1]))
     return proposed, max_distance
+
+
+# ---------------------------------------------------------------------------
+# IXFR 增量链（POST /transfer-plan）
+# ---------------------------------------------------------------------------
+
+UP_TO_DATE = "up_to_date"
+IXFR = "ixfr"
+AXFR = "axfr"
+
+# axfr 的 reason
+GAP = "gap"
+"""增量链存在缺口（某序列号没有对应的下一条增量）。"""
+LOOP = "loop"
+"""沿增量链行进时回到了已经过的序列号，形成环路。"""
+TARGET_INCOMPARABLE = "target_incomparable"
+"""副本当前值与目标序列号在 RFC 1982 下不可比较（前向距离恰为 2^31）。"""
+
+
+class DeltaValidationError(ValueError):
+    """增量集合非法：存在非严格 newer 的增量，或同一 from_serial 分叉。"""
+
+    def __init__(self, detail: dict):
+        super().__init__(str(detail))
+        self.detail = detail
+
+
+def build_delta_chain(
+    deltas: List[Tuple[int, int]],
+) -> dict:
+    """校验并归一化一组无序 IXFR 增量，返回 ``from_serial -> to_serial`` 映射。
+
+    处理顺序：
+
+    1. 每条增量都必须满足 ``to_serial`` 按 RFC 1982 **严格新于**
+       ``from_serial``（前向距离在 ``[1, 2^31-1]``），否则抛出
+       ``DeltaValidationError``（error=delta_not_strictly_newer）；
+    2. 完全相同的 ``(from_serial, to_serial)`` 重复增量去重；
+    3. 同一 ``from_serial`` 指向不同 ``to_serial`` 即链分叉，抛出
+       ``DeltaValidationError``（error=delta_fork）。
+
+    校验后每个 from_serial 至多有一个后继，因此任何完整链都是唯一的。
+    """
+    # 第一步：逐条拒绝非严格 newer 的增量（保留输入顺序，报错确定可复现）
+    for from_serial, to_serial in deltas:
+        relation = compare_serial(from_serial, to_serial)
+        if relation != NEWER:
+            raise DeltaValidationError(
+                {
+                    "error": "delta_not_strictly_newer",
+                    "message": (
+                        "增量的 to_serial 必须按 RFC 1982 严格新于 from_serial"
+                        "（前向距离在 [1, 2^31-1]）"
+                    ),
+                    "from_serial": from_serial,
+                    "to_serial": to_serial,
+                    "relation": relation,
+                }
+            )
+
+    # 第二步 + 第三步：重复去重，分叉拒绝
+    chain: dict = {}
+    for from_serial, to_serial in deltas:
+        if from_serial in chain:
+            if chain[from_serial] == to_serial:
+                continue  # 重复增量，去重
+            raise DeltaValidationError(
+                {
+                    "error": "delta_fork",
+                    "message": (
+                        f"同一 from_serial={from_serial} 指向不同的 to_serial，"
+                        "增量链不允许分叉"
+                    ),
+                    "from_serial": from_serial,
+                    "to_serials": [chain[from_serial], to_serial],
+                }
+            )
+        chain[from_serial] = to_serial
+    return chain
+
+
+def plan_transfer(
+    current: int,
+    target: int,
+    chain: dict,
+) -> Tuple[str, Optional[str], List[Tuple[int, int]]]:
+    """为单个副本规划从 *current* 到 *target* 的传输方式。
+
+    *chain* 为 :func:`build_delta_chain` 产出的 ``from_serial -> to_serial``
+    映射，每条边都是 RFC 1982 严格推进。沿边逐跳追踪（**不做整数排序**，
+    仅以增量自带的环形先后关系为准）：
+
+    * ``current == target``：``(up_to_date, None, [])``；
+    * 两端在 RFC 1982 下不可比较（前向距离恰为 2^31）：
+      ``(axfr, target_incomparable, [])``，即使存在能连通的边也必须 AXFR；
+    * 沿唯一增量链可抵达 *target*：``(ixfr, None, ordered_deltas)``；
+    * 某一跳找不到后继：``(axfr, gap, [])``；
+    * 行进中重复经过某序列号（环路）：``(axfr, loop, [])``。
+    """
+    if current == target:
+        return UP_TO_DATE, None, []
+
+    if compare_serial(current, target) == AMBIGUOUS:
+        return AXFR, TARGET_INCOMPARABLE, []
+
+    ordered: List[Tuple[int, int]] = []
+    visited = {current}
+    node = current
+    while node != target:
+        nxt = chain.get(node)
+        if nxt is None:
+            return AXFR, GAP, []
+        if nxt in visited:
+            return AXFR, LOOP, []
+        ordered.append((node, nxt))
+        visited.add(nxt)
+        node = nxt
+    return IXFR, None, ordered

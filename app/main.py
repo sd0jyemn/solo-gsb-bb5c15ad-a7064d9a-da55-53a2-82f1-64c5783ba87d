@@ -9,13 +9,20 @@ from .schemas import (
     AuditItem,
     AuditRequest,
     AuditResponse,
+    OrderedDelta,
     ProposeItem,
     ProposeRequest,
     ProposeResponse,
+    TransferPlanItem,
+    TransferPlanRequest,
+    TransferPlanResponse,
 )
 from .serial import (
+    build_delta_chain,
     compare_serial,
+    DeltaValidationError,
     forward_distance,
+    plan_transfer,
     propose_serial,
 )
 
@@ -129,3 +136,50 @@ def propose(request: ProposeRequest) -> ProposeResponse:
         max_forward_distance=max_distance,
         results=results,
     )
+
+
+@app.post("/transfer-plan", response_model=TransferPlanResponse)
+def transfer_plan(request: TransferPlanRequest) -> TransferPlanResponse:
+    """规划各副本到目标 SOA 序列号的增量 / 全量传输。
+
+    先对无序增量集合做整体校验（422）：
+
+    * 每条增量的 to_serial 必须按 RFC 1982 严格新于 from_serial；
+    * 同一 from_serial 指向不同 to_serial 的分叉增量被拒绝；
+    * 完全相同的重复增量去重。
+
+    再为每个副本沿增量链逐跳追踪（遵循 RFC 1982 环形顺序，不做整数排序）：
+
+    * 当前值已等于目标：``up_to_date``；
+    * 存在唯一完整链抵达目标：``ixfr``，并返回按序排列的 ordered_deltas；
+    * 存在缺口（gap）、环路（loop）或目标与当前值不可比较
+      （target_incomparable，前向距离恰为 2^31）：``axfr`` 并给出 reason。
+    """
+    _check_duplicate_names([r.name for r in request.replicas])
+
+    raw_deltas = [(d.from_serial, d.to_serial) for d in request.deltas]
+    try:
+        chain = build_delta_chain(raw_deltas)
+    except DeltaValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail)
+
+    results = []
+    for replica in request.replicas:
+        mode, reason, ordered = plan_transfer(
+            replica.current, request.target, chain
+        )
+        results.append(
+            TransferPlanItem(
+                name=replica.name,
+                current=replica.current,
+                target=request.target,
+                mode=mode,
+                reason=reason,
+                ordered_deltas=[
+                    OrderedDelta(from_serial=frm, to_serial=to)
+                    for frm, to in ordered
+                ],
+            )
+        )
+
+    return TransferPlanResponse(target=request.target, results=results)

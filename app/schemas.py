@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Annotated, List, Literal
+from typing import Annotated, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from .serial import MAX_SERIAL, NEWER, EQUAL, OLDER, AMBIGUOUS
+from .serial import MAX_SERIAL, NEWER, EQUAL, OLDER, AMBIGUOUS, AXFR, IXFR, UP_TO_DATE
 
 Serial32 = Annotated[int, Field(ge=0, le=MAX_SERIAL)]
 Relation = Literal["newer", "equal", "older", "ambiguous"]
@@ -106,3 +106,74 @@ class ProposeResponse(BaseModel):
         description="所有副本中最大的前向模距离（被最小化的目标）",
     )
     results: List[ProposeItem]
+
+
+# ---------------------------------------------------------------------------
+# POST /transfer-plan
+# ---------------------------------------------------------------------------
+
+TransferMode = Literal["up_to_date", "ixfr", "axfr"]
+TRANSFER_MODES = (UP_TO_DATE, IXFR, AXFR)
+TransferReason = Literal["gap", "loop", "target_incomparable"]
+
+
+class IxfrDelta(BaseModel):
+    """一条无序 IXFR 增量：from_serial 到 to_serial（须严格 newer）。"""
+
+    from_serial: int = Field(..., description="增量起始 32 位无符号 SOA 序列号")
+    to_serial: int = Field(..., description="增量目标 32 位无符号 SOA 序列号")
+
+    @field_validator("from_serial", "to_serial", mode="before")
+    @classmethod
+    def _serial32_fields(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+
+class TransferPlanRequest(BaseModel):
+    """POST /transfer-plan 请求体。"""
+
+    target: int = Field(..., description="目标 32 位无符号 SOA 序列号")
+    replicas: List[ReplicaCurrent] = Field(..., min_length=1)
+    deltas: List[IxfrDelta] = Field(
+        ..., description="一组无序 IXFR 增量（允许重复，分叉将被拒绝）",
+    )
+
+    @field_validator("target", mode="before")
+    @classmethod
+    def _target_serial32(cls, value: object) -> int:
+        return _coerce_serial32(value)
+
+
+class OrderedDelta(BaseModel):
+    """按链路顺序排列好的单条 IXFR 增量。"""
+
+    from_serial: int
+    to_serial: int
+
+
+class TransferPlanItem(BaseModel):
+    """单个副本的传输规划结果（顺序与请求中的副本一致）。"""
+
+    name: str
+    current: int
+    target: int
+    mode: TransferMode = Field(
+        ...,
+        description=(
+            "up_to_date：当前值已等于目标；ixfr：存在唯一完整增量链；"
+            "axfr：存在缺口/环路或目标不可比较"
+        ),
+    )
+    reason: Optional[TransferReason] = Field(
+        ..., description="仅 axfr 时给出原因：gap / loop / target_incomparable",
+    )
+    ordered_deltas: List[OrderedDelta] = Field(
+        ..., description="ixfr 时按从当前值到目标的顺序给出增量；其余模式为空",
+    )
+
+
+class TransferPlanResponse(BaseModel):
+    """POST /transfer-plan 响应体。"""
+
+    target: int
+    results: List[TransferPlanItem]
